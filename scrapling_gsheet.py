@@ -25,7 +25,7 @@ def get_sheet():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
     client = gspread.authorize(creds)
-    sheet = client.open_by_key(GSHEET_ID).get_worksheet(0)
+    sheet = client.open_by_key(GSHEET_ID).worksheet("Console")
     return sheet
 
 def html_to_markdown(html_content):
@@ -71,7 +71,8 @@ async def scrape_url(semaphore, row_idx, domain):
             try:
                 # LEVEL 1: Static (Fast)
                 try:
-                    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=7, proxy=PROXY_URL) as client:
+                    # Increased timeout from 7s to 12s for slow/large sites
+                    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=12, proxy=PROXY_URL) as client:
                         resp = await client.get(current_url)
                         if len(resp.text) > 250: emergency_html = resp.text
                         
@@ -83,22 +84,24 @@ async def scrape_url(semaphore, row_idx, domain):
                                 final_status = "Success (Static)"
                                 break
                         raise Exception("Insufficient content or block")
-                except Exception:
+                except Exception as static_err:
                     # LEVEL 2: Stealth Browser
                     try:
+                        # Increased timeout to 60s for heavy sites
                         response = await StealthyFetcher.async_fetch(
-                            current_url, timeout=45000, proxy=PROXY_URL,
+                            current_url, timeout=60000, proxy=PROXY_URL,
                             humanize=True, os_randomize=True, block_images=True,
                             disable_ads=True, disable_resources=True, geoip=True,
                             network_idle=True,
-                            wait=800,
-                            allow_webgl=HW_SPECS["gpu_available"] # Utilize GPU if available
+                            wait=1500, # Increased wait for JS-heavy sites
+                            allow_webgl=HW_SPECS["gpu_available"]
                         )
                         final_html = response.html_content
                         final_status = "Success (Stealth)"
                         break
                     except Exception as l2_err:
                         last_error = f"Browser: {str(l2_err)[:60]}"
+                        # If DNS fails on raw domain, try variants
                         if "NS_ERROR_UNKNOWN_HOST" in str(l2_err): continue
             except Exception:
                 continue
@@ -118,6 +121,45 @@ async def scrape_url(semaphore, row_idx, domain):
             print(f"❌ [{row_idx}] Failed: {domain} ({last_error})")
             
         return [content, final_status, duration, char_len]
+
+async def gsheet_writer(sheet, queue, total_count):
+    """Background worker to save results in batches without blocking the scraper."""
+    processed = 0
+    buffer = [] # list of (row_idx, data)
+    
+    while processed < total_count:
+        try:
+            # Wait for data from queue
+            item = await asyncio.wait_for(queue.get(), timeout=5.0)
+            buffer.append(item)
+            processed += 1
+            queue.task_done()
+        except asyncio.TimeoutError:
+            pass # Pulse check for buffer flush
+
+        # Flush buffer if it's large enough or we're at a pulse check
+        if len(buffer) >= 20 or (buffer and processed == total_count):
+            # Sort buffer by row_idx for easier debugging, though not strictly required
+            buffer.sort(key=lambda x: x[0])
+            
+            # Group contiguous rows if possible for efficiency, 
+            # but for now, we'll do individual updates or small batches to avoid complexity
+            # Note: GSheet API likes batch_update for non-contiguous ranges
+            batch_updates = []
+            for row_idx, data in buffer:
+                batch_updates.append({
+                    'range': f'B{row_idx}:E{row_idx}',
+                    'values': [data]
+                })
+            
+            try:
+                if batch_updates:
+                    sheet.batch_update(batch_updates)
+                    print(f"📤 Saved {len(buffer)} results to GSheet. ({processed}/{total_count})")
+            except Exception as e:
+                print(f"⚠️ GSheet Batch Save Failed: {e}")
+            
+            buffer = []
 
 async def main():
     print(f"🚀 Initializing Hardware-Aware Scraper...")
@@ -140,32 +182,29 @@ async def main():
         print("⚠️ No data in sheet (Column A should contain URLs starting from Row 2).")
         return
     
-    # Identify domains from Column A (Row 2 onwards)
+    # Identify domains from Column A
     domains = [row[0] for row in rows[1:] if row and row[0].strip()] 
     total_domains = len(domains)
     print(f"📋 Found {total_domains} domains to process.")
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCRAPES)
+    save_queue = asyncio.Queue()
     start_all = time.time()
     
-    # Process in batches for GSheet safety (Batch size 50)
-    BATCH_SIZE = 50
-    for i in range(0, total_domains, BATCH_SIZE):
-        batch_domains = domains[i:i+BATCH_SIZE]
-        batch_indices = range(i + 2, i + 2 + len(batch_domains))
-        
-        tasks = [scrape_url(semaphore, idx, dom) for idx, dom in zip(batch_indices, batch_domains)]
-        results = await asyncio.gather(*tasks)
+    # Define the worker that feeds the queue
+    async def worker(row_idx, domain):
+        result = await scrape_url(semaphore, row_idx, domain)
+        await save_queue.put((row_idx, result))
 
-        # Batch update this chunk to GSheet: Columns B, C, D, E
-        start_row = i + 2
-        end_row = i + 1 + len(results)
-        try:
-            # results contains: [content, status, duration, char_len]
-            sheet.update(f'B{start_row}:E{end_row}', results)
-            print(f"📤 Saved Batch {i//BATCH_SIZE + 1} to GSheet.")
-        except Exception as e:
-            print(f"⚠️ GSheet Update Failed for batch {i}: {e}")
+    # Start the background saver
+    saver_task = asyncio.create_task(gsheet_writer(sheet, save_queue, total_domains))
+    
+    # Start all scrapers concurrently (Semaphore handles the limit)
+    tasks = [worker(i+2, dom) for i, dom in enumerate(domains)]
+    await asyncio.gather(*tasks)
+    
+    # Wait for the saver to finish remaining buffer
+    await saver_task
 
     total_duration = round(time.time() - start_all, 2)
     try:
