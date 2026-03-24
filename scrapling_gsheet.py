@@ -127,17 +127,21 @@ async def main():
     
     try:
         sheet = get_sheet()
+        # Proactively write headers as requested
+        headers = ["Domain", "Raw Content", "Status", "Time taken per domain", "Char Length", "Total Time taken", "Concurrency"]
+        sheet.update('A1:G1', [headers])
+        
         rows = sheet.get_all_values()
     except Exception as e:
         print(f"❌ Initial GSheet connection failed: {e}")
         return
 
     if not rows or len(rows) < 2:
-        print("⚠️ No data in sheet.")
+        print("⚠️ No data in sheet (Column A should contain URLs starting from Row 2).")
         return
     
-    # Identify headers and data
-    domains = [row[0] for row in rows[1:]] 
+    # Identify domains from Column A (Row 2 onwards)
+    domains = [row[0] for row in rows[1:] if row and row[0].strip()] 
     total_domains = len(domains)
     print(f"📋 Found {total_domains} domains to process.")
 
@@ -153,10 +157,11 @@ async def main():
         tasks = [scrape_url(semaphore, idx, dom) for idx, dom in zip(batch_indices, batch_domains)]
         results = await asyncio.gather(*tasks)
 
-        # Batch update this chunk to GSheet
+        # Batch update this chunk to GSheet: Columns B, C, D, E
         start_row = i + 2
         end_row = i + 1 + len(results)
         try:
+            # results contains: [content, status, duration, char_len]
             sheet.update(f'B{start_row}:E{end_row}', results)
             print(f"📤 Saved Batch {i//BATCH_SIZE + 1} to GSheet.")
         except Exception as e:
@@ -164,7 +169,8 @@ async def main():
 
     total_duration = round(time.time() - start_all, 2)
     try:
-        sheet.update('D2', [[f"{total_duration}s"]])
+        # F2: Total Time, G2: Concurrency
+        sheet.update('F2:G2', [[f"{total_duration}s", str(MAX_CONCURRENT_SCRAPES)]])
     except Exception:
         pass
         
