@@ -1,0 +1,15 @@
+# Credentials
+credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# MacOS
+.DS_Store
+
+# Logs
+*.log
