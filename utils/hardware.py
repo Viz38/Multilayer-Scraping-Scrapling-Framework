@@ -21,21 +21,34 @@ class HardwareOptimizer:
             if specs["os"] == "Darwin":
                 # Check for Apple Silicon or discrete GPU on Mac
                 cmd = ["system_profiler", "SPDisplaysDataType"]
-                output = subprocess.check_output(cmd).decode()
+                output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode()
                 if "Apple M" in output or "Radeon" in output:
                     specs["gpu_available"] = True
                     specs["gpu_details"] = "Apple Silicon / Discrete Mac GPU"
             elif specs["os"] == "Windows":
-                import wmi
-                w = wmi.WMI()
-                for gpu in w.Win32_VideoController():
+                # Use standard wmic command to avoid third-party 'wmi' dependency
+                cmd = ["wmic", "path", "win32_VideoController", "get", "name"]
+                output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode()
+                clean_output = [line.strip() for line in output.split("\n") if line.strip() and "Name" not in line]
+                if clean_output:
                     specs["gpu_available"] = True
-                    specs["gpu_details"] = gpu.Name
+                    specs["gpu_details"] = ", ".join(clean_output)
             else: # Linux
-                output = subprocess.check_output(["lspci"]).decode()
-                if "NVIDIA" in output.upper() or "AMD" in output.upper():
-                    specs["gpu_available"] = True
-                    specs["gpu_details"] = "Discrete Linux GPU Detected"
+                # Check for NVIDIA specifically via nvidia-smi
+                try:
+                    nv_output = subprocess.check_output(["nvidia-smi", "-L"], stderr=subprocess.DEVNULL).decode()
+                    if "GPU" in nv_output:
+                        specs["gpu_available"] = True
+                        specs["gpu_details"] = nv_output.strip().split("\n")[0]
+                except Exception:
+                    # Fallback to lspci for Intel/AMD
+                    try:
+                        lspci_output = subprocess.check_output(["lspci"], stderr=subprocess.DEVNULL).decode()
+                        if "VGA" in lspci_output or "3D" in lspci_output:
+                            specs["gpu_available"] = True
+                            specs["gpu_details"] = "Linux Integrated/Discrete GPU Detected"
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -43,22 +56,29 @@ class HardwareOptimizer:
 
     @staticmethod
     def calculate_concurrency():
-        """Heuristic for max concurrency: 4 workers per core, capped by RAM (250MB/worker)."""
+        """Heuristic for max concurrency: 8 workers per core if RAM allows."""
         specs = HardwareOptimizer.get_specs()
         
-        # Concurrency by CPU (Network tasks can handle many threads)
-        cpu_concurrency = specs["cpu_cores"] * 6 
+        # Explicit casts to prevent type-guessing errors
+        cores = int(specs["cpu_cores"])
+        avail_ram = float(specs["available_ram_gb"])
         
-        # Concurrency by RAM (Safety first)
-        # Assuming each browser instance uses ~250MB
-        ram_concurrency = int(specs["available_ram_gb"] * 1024 / 250)
+        # Concurrency by CPU: 8 workers per core is safe for high-density IO tasks
+        cpu_concurrency = cores * 8 
         
-        # Final decision: Minimum of CPU threads vs RAM capacity
-        concurrency = max(5, min(cpu_concurrency, ram_concurrency))
+        # Concurrency by RAM: 250MB per worker safety margin
+        # We use 80% of available RAM as a safe upper bound
+        safe_ram_mb = (avail_ram * 1024.0) * 0.8
+        ram_concurrency = int(safe_ram_mb / 250)
         
-        # If GPU is available, we can slightly bump it up as rendering load is offloaded
+        # Final decision: Min of CPU threads vs RAM capacity, floor at 10
+        concurrency = float(max(10, min(cpu_concurrency, ram_concurrency)))
+        
+        # If GPU is available, we bump processing by 20%
         if specs["gpu_available"]:
-            concurrency = int(concurrency * 1.25)
+            concurrency = int(concurrency * 1.2)
+        else:
+            concurrency = int(concurrency)
 
         return concurrency, specs
 

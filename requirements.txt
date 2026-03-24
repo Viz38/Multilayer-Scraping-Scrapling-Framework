@@ -1,0 +1,7 @@
+scrapling
+gspread
+google-auth
+httpx
+beautifulsoup4
+markdownify
+psutil
